@@ -3,9 +3,14 @@ import StealthPlugin from 'puppeteer-extra-plugin-stealth';
 import OpenAI from 'openai';
 import readline from 'readline';
 import fs from 'fs';
-import { Page } from 'puppeteer';
+import { Page, TimeoutError } from 'puppeteer';
 import { ChatCompletionMessageParam } from 'openai/resources/chat/completions';
-import { annotateAndTakeScreenshot } from './annotation';
+import {
+  annotateAndTakeScreenshot,
+  INPUT_FIELD_ATTRIBUTE,
+  LINK_ATTRIBUTE,
+  SCROLLABLE_AREA_ATTRIBUTE,
+} from './annotation';
 
 require('dotenv/config');
 
@@ -71,6 +76,8 @@ async function waitForEvent(page: Page, event) {
   }, event);
 }
 
+class InvalidJsonResponseError extends Error {}
+
 (async () => {
   const browser = await puppeteer.launch({
     headless: false,
@@ -78,11 +85,12 @@ async function waitForEvent(page: Page, event) {
     // userDataDir: '',
   });
 
-  const page = await browser.newPage();
+  // This can change if a link that is opened opens a new tab - we automatically focus into that tab.
+  let currentPage = await browser.newPage();
 
-  await page.setViewport({
+  await currentPage.setViewport({
     width: 1200,
-    height: 1200,
+    height: 800,
     deviceScaleFactor: 1,
   });
 
@@ -92,7 +100,8 @@ async function waitForEvent(page: Page, event) {
       content: `You are a website crawler that tests websites and web apps. You will be given instructions on what to do by browsing. You are connected to a web browser and you will be given the screenshot of the website you are on.
             
             The links on the website will be highlighted in red in the screenshot. Always read what is in the screenshot. Don't guess link names.
-            The text fields are highlighted in yellow in the screenshot. 
+            The text fields are highlighted in yellow in the screenshot.
+            Scrollable areas are highlighted in green in the screenshot, with the identifier in the top left corner of the area. Reference that identifier when scrolling the area.
 
             You can go to a specific URL by answering with the following JSON format:
             {"url": "url goes here"}
@@ -102,6 +111,9 @@ async function waitForEvent(page: Page, event) {
 
             You can type into text fields by returning text to type and specifying by answering with the following JSON format:
             {"type": "Text in the input", "value": "Text to type"}
+
+            You can scroll a specific area by answering in the following JSON format:
+            {"scroll": "identifier of the scrollable area", "value": "amount of pixels to scroll"}
 
             Once you are on a URL and you have found the answer to the user's question, you can answer with a regular message.
 
@@ -118,25 +130,183 @@ async function waitForEvent(page: Page, event) {
     content: prompt as unknown as string,
   });
 
-  let url;
   let screenshotTaken = false;
 
-  while (true) {
-    if (url) {
-      console.log('Crawling ' + url);
-      await page.goto(url, {
-        waitUntil: 'domcontentloaded',
-        timeout: timeout,
-      });
+  async function handleClickAction(chatGPTResponse: string) {
+    const jsonObject = parseJsonResponse(chatGPTResponse);
+    const link = jsonObject.click;
 
-      await Promise.race([waitForEvent(page, 'load'), sleep(timeout)]);
+    console.log('Clicking on ' + link);
 
-      await annotateAndTakeScreenshot(page);
+    const elements = await currentPage.$$(`[${LINK_ATTRIBUTE}]`);
 
-      screenshotTaken = true;
-      url = null;
+    let partial;
+    let exact;
+
+    for (const element of elements) {
+      const attributeValue = await element.evaluate(
+        (el, attribute) => el.getAttribute(attribute),
+        LINK_ATTRIBUTE,
+      );
+
+      if (attributeValue?.includes(link)) {
+        partial = element;
+      }
+
+      if (attributeValue === link) {
+        exact = element;
+      }
     }
 
+    const elementToClick = exact || partial;
+
+    if (elementToClick) {
+      // Save target of original page to know that this was the opener:
+      const pageTarget = currentPage.target();
+      await elementToClick.click();
+
+      // Clicking on a link might have opened a new page.
+      // We have to check whether that's the case by waiting for target for a little bit
+      console.log('Waiting for target');
+
+      try {
+        const newTarget = await browser.waitForTarget(
+          (target) => target.opener() === pageTarget,
+          {
+            // Let's wait 2 seconds after we assume no new page was opened
+            // This is also fine for any dropdowns / animations to appear that might be caused by the click
+            timeout: 2_000,
+          },
+        );
+        // Cet the new page object:
+        const newPage = await newTarget.page();
+        if (newPage) {
+          currentPage = newPage;
+        }
+      } catch (err) {
+        // If the waitForTarget timed out, it means no new page was opened
+        if (err instanceof TimeoutError) {
+          //
+        } else {
+          throw err;
+        }
+      }
+
+      // Additional checks can be done here, like validating the response or URL
+      await Promise.race([waitForEvent(currentPage, 'load'), sleep(timeout)]);
+
+      await annotateAndTakeScreenshot(currentPage);
+      screenshotTaken = true;
+    } else {
+      throw new Error("Can't find link");
+    }
+  }
+
+  async function handleUrlAction(chatGPTResponse: string) {
+    const jsonObject = parseJsonResponse(chatGPTResponse);
+    const url = jsonObject.url;
+
+    console.log('Crawling ' + url);
+
+    await currentPage.goto(url, {
+      waitUntil: 'domcontentloaded',
+      timeout: timeout,
+    });
+
+    await Promise.race([waitForEvent(currentPage, 'load'), sleep(timeout)]);
+
+    await annotateAndTakeScreenshot(currentPage);
+    screenshotTaken = true;
+  }
+
+  function parseJsonResponse(jsonResponse: string) {
+    const jsonMatch = jsonResponse.match(/{.*}/);
+    if (jsonMatch) {
+      try {
+        return JSON.parse(jsonMatch[0]);
+      } catch (err) {
+        throw new InvalidJsonResponseError();
+      }
+    } else {
+      throw new InvalidJsonResponseError();
+    }
+  }
+
+  async function handleTypeAction(chatGPTResponse: string) {
+    const jsonObject = parseJsonResponse(chatGPTResponse);
+    const input = jsonObject.type;
+    const value = jsonObject.value;
+
+    console.log(`Typing ${value} into ${input}...`);
+
+    const elements = await currentPage.$$(`[${INPUT_FIELD_ATTRIBUTE}]`);
+    let partial;
+    let exact;
+
+    for (const element of elements) {
+      const attributeValue = await element.evaluate(
+        (el, attribute) => el.getAttribute(attribute),
+        INPUT_FIELD_ATTRIBUTE,
+      );
+
+      if (attributeValue?.includes(input)) {
+        partial = element;
+      }
+
+      if (attributeValue === input) {
+        exact = element;
+      }
+    }
+
+    const element = exact || partial;
+    if (element) {
+      element.type(value);
+      await annotateAndTakeScreenshot(currentPage);
+      screenshotTaken = true;
+    } else {
+      throw new Error("Can't find input field");
+    }
+  }
+
+  async function handleScrollAction(chatGPTResponse: string) {
+    const jsonObject = parseJsonResponse(chatGPTResponse);
+    const scrollableArea = jsonObject.scroll;
+    const value = jsonObject.value; // NOTE: we could fallback to one height of the scrollable area here
+
+    console.log(`Scrolling ${value} px of ${scrollableArea}...`);
+
+    const elements = await currentPage.$$(`[${SCROLLABLE_AREA_ATTRIBUTE}]`);
+    let foundArea;
+
+    for (const element of elements) {
+      const attributeValue = await element.evaluate(
+        (el, attribute) => el.getAttribute(attribute),
+        SCROLLABLE_AREA_ATTRIBUTE,
+      );
+
+      // Sometimes, LLM return the identifier without i- prefix
+      if (attributeValue?.includes(scrollableArea)) {
+        foundArea = element;
+      }
+    }
+
+    if (foundArea) {
+      // TODO: scrollLeft
+      foundArea.evaluate(
+        (el, scrollAmount) => {
+          el.scrollBy(0, scrollAmount);
+        },
+        parseInt(value, 10),
+      );
+
+      await annotateAndTakeScreenshot(currentPage);
+      screenshotTaken = true;
+    } else {
+      throw new Error("Can't find provided scroll area");
+    }
+  }
+
+  while (true) {
     if (screenshotTaken) {
       const base64_image = await imageToBase64('screenshot.jpg');
 
@@ -165,7 +335,7 @@ async function waitForEvent(page: Page, event) {
       messages: messages,
     });
 
-    console.log('response', response);
+    console.log('Response:', response);
 
     const message = response.choices[0].message;
     const chatGPTResponse = message.content;
@@ -177,108 +347,73 @@ async function waitForEvent(page: Page, event) {
 
     console.log('GPT: ' + chatGPTResponse);
 
-    if (chatGPTResponse?.indexOf('{"click": "') !== -1) {
-      // @ts-expect-error FIXME
-      let parts = chatGPTResponse.split('{"click": "');
-      parts = parts[1].split('"}');
-      const link_text = parts[0].replace(/[^a-zA-Z0-9 ]/g, '');
-
-      console.log('Clicking on ' + link_text);
-
+    // Handle actions from the LLM
+    if (
+      chatGPTResponse?.indexOf('{"click": "') !== -1 ||
+      chatGPTResponse?.indexOf('{"click":"') !== -1
+    ) {
       try {
-        const elements = await page.$$('[gpt-link-text]');
-
-        let partial;
-        let exact;
-
-        for (const element of elements) {
-          const attributeValue = await element.evaluate((el) =>
-            el.getAttribute('gpt-link-text'),
-          );
-
-          if (attributeValue?.includes(link_text)) {
-            partial = element;
-          }
-
-          if (attributeValue === link_text) {
-            exact = element;
-          }
-        }
-
-        if (exact || partial) {
-          // TODO: handle case when the link does not navigate to a new page
-          const [response] = await Promise.all([
-            page
-              .waitForNavigation({ waitUntil: 'domcontentloaded' })
-              .catch((e) =>
-                console.log('Navigation timeout/error:', e.message),
-              ),
-            // @ts-expect-error FIXME
-            (exact || partial).click(),
-          ]);
-
-          // Additional checks can be done here, like validating the response or URL
-          await Promise.race([waitForEvent(page, 'load'), sleep(timeout)]);
-
-          await annotateAndTakeScreenshot(page);
-
-          screenshotTaken = true;
-        } else {
-          throw new Error("Can't find link");
-        }
+        await handleClickAction(chatGPTResponse as string);
       } catch (error) {
-        console.log('ERROR: Clicking failed', error);
+        console.log('Error clicking the element:', error);
 
-        messages.push({
-          role: 'user',
-          content: 'ERROR: I was unable to click that element',
-        });
-      }
-
-      continue;
-    } else if (chatGPTResponse.indexOf('{"url": "') !== -1) {
-      let parts = chatGPTResponse.split('{"url": "');
-      parts = parts[1].split('"}');
-      url = parts[0];
-
-      continue;
-    } else if (chatGPTResponse.indexOf('{"type": "') !== -1) {
-      const jsonMatch = chatGPTResponse.match(/{.*}/);
-      if (jsonMatch) {
-        const jsonObject = JSON.parse(jsonMatch[0]);
-        const input = jsonObject.type;
-        const value = jsonObject.value;
-        console.log(`Typing ${value} into ${input}...`);
-
-        const elements = await page.$$('[gpt-input-fields]');
-        let partial;
-        let exact;
-
-        for (const element of elements) {
-          const attributeValue = await element.evaluate((el) =>
-            el.getAttribute('gpt-input-fields'),
-          );
-
-          if (attributeValue?.includes(input)) {
-            partial = element;
-          }
-
-          if (attributeValue === input) {
-            exact = element;
-          }
-        }
-
-        if (exact || partial) {
-          (exact || partial)?.type(value);
-
-          await annotateAndTakeScreenshot(page);
-
-          screenshotTaken = true;
+        if (error instanceof InvalidJsonResponseError) {
+          messages.push({
+            role: 'user',
+            content:
+              'The json you provided was invalid. Please provide a valid JSON response.',
+          });
         } else {
-          throw new Error("Can't find input field");
+          messages.push({
+            role: 'user',
+            content: 'Error: I was unable to click on that element.',
+          });
         }
-      } else {
-        throw new Error('Unable to parse JSON type response from LLM');
+      }
+    } else if (
+      chatGPTResponse.indexOf('{"url": "') !== -1 ||
+      chatGPTResponse.indexOf('{"url":"') !== -1
+    ) {
+      await handleUrlAction(chatGPTResponse as string);
+    } else if (chatGPTResponse.indexOf('{"type": "') !== -1) {
+      try {
+        await handleTypeAction(chatGPTResponse as string);
+      } catch (error) {
+        console.log('Error typing into the input:', error);
+
+        if (error instanceof InvalidJsonResponseError) {
+          messages.push({
+            role: 'user',
+            content:
+              'The json you provided was invalid. Please provide a valid JSON response.',
+          });
+        } else {
+          messages.push({
+            role: 'user',
+            content:
+              'Error: I was unable to typo into that input field. Because it does not exist. Please provide a different input field.',
+          });
+        }
+      }
+    } else if (chatGPTResponse.indexOf('{"scroll": "') !== -1) {
+      try {
+        await handleScrollAction(chatGPTResponse as string);
+      } catch (error) {
+        console.log('Error scrolling an area:', error);
+
+        if (error instanceof InvalidJsonResponseError) {
+          messages.push({
+            role: 'user',
+            content:
+              'The json you provided was invalid. Please provide a valid JSON response.',
+          });
+        } else {
+          messages.push({
+            role: 'user',
+            content:
+              'Error: I was unable to scroll that area because it does not exist. Please provide a different scroll area.',
+          });
+        }
       }
     }
 
