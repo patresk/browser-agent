@@ -4,12 +4,13 @@ import { join } from 'path';
 import { sleep } from '../util';
 
 (async () => {
-  //const website = 'https://mobile.de';
-  //   const website = 'http://finance.yahoo.com/';
+  // NOTE: Testing pages for dev
+  // const website = 'https://mobile.de';
+  // const website = 'https://finance.yahoo.com/';
   const website = 'https://sme.sk';
-  const browserAgent = await createBrowserAgent();
 
-  const page = await browserAgent.getPage();
+  const browserAgent = await createBrowserAgent();
+  const page = await browserAgent.getCurrentPage();
 
   await page.goto(website);
 

@@ -10,270 +10,234 @@ import {
 } from './annotation';
 import { sleep, waitForEvent } from './util';
 
-const TIMEOUT = 5000;
+const DEFAULT_OPTIONS = {
+  timeout: 5000,
+  viewport: {
+    width: 1440, // 13" Mac screen
+    height: 800,
+    deviceScaleFactor: 1,
+  },
+};
 
 puppeteer.use(StealthPlugin());
 
-export async function createBrowserAgent() {
+interface BrowserAgentOptions {
+  headless?: boolean;
+  executablePath?: string;
+  userDataDir?: string;
+  timeout?: number;
+  viewport?: {
+    width: number;
+    height: number;
+    deviceScaleFactor: number;
+  };
+}
+
+interface ActionResult {
+  screenshot: string;
+  selectOptions: Array<{ id: string; options: string[] }> | null;
+}
+
+export async function createBrowserAgent(
+  options: BrowserAgentOptions = {},
+): Promise<BrowserAgent> {
   const browser = await puppeteer.launch({
-    headless: false,
-    // executablePath: '',
-    // userDataDir: '',
+    headless: options.headless ?? false,
+    executablePath: options.executablePath,
+    userDataDir: options.userDataDir,
   });
 
-  // Note that a page can change if a link that opens a new tab - we focus into that tab.
   const page = await browser.newPage();
+  await page.setViewport(options.viewport ?? DEFAULT_OPTIONS.viewport);
 
-  await page.setViewport({
-    // 13" Mac screen
-    width: 1440,
-    height: 800,
-    deviceScaleFactor: 1,
-  });
-
-  return new BrowserAgent(browser, page);
+  return new BrowserAgent(
+    browser,
+    page,
+    options.timeout ?? DEFAULT_OPTIONS.timeout,
+  );
 }
 
 export class BrowserAgent {
-  browser: Browser;
-  currentPage: Page;
+  private readonly browser: Browser;
+  private currentPage: Page;
+  private readonly logs: string[] = [];
+  private readonly timeout: number;
 
-  private logs: Array<Buffer> = [];
-
-  constructor(browser: Browser, currentPage: Page) {
+  constructor(browser: Browser, currentPage: Page, timeout: number) {
     this.browser = browser;
     this.currentPage = currentPage;
+    this.timeout = timeout;
   }
 
-  public async getLogs() {
-    return this.logs;
+  public async getLogs(): Promise<string[]> {
+    return [...this.logs];
   }
 
-  public async getPage() {
+  public async getCurrentPage(): Promise<Page> {
     return this.currentPage;
   }
 
-  public annotateAndTakeScreenshot = async () => {
+  private async findElementByAttribute(
+    attribute: string,
+    value: string,
+  ): Promise<any | null> {
+    const elements = await this.currentPage.$$(`[${attribute}]`);
+    let partial = null;
+    let exact = null;
+
+    for (const element of elements) {
+      const attributeValue = await element.evaluate(
+        (el, attr) => el.getAttribute(attr),
+        attribute,
+      );
+
+      if (attributeValue?.includes(value)) {
+        partial = element;
+      }
+
+      if (attributeValue === value) {
+        exact = element;
+      }
+    }
+
+    return exact || partial;
+  }
+
+  private async handleNewPageOpening(pageTarget: any): Promise<void> {
+    try {
+      const newTarget = await this.browser.waitForTarget(
+        (target) => target.opener() === pageTarget,
+        { timeout: this.timeout },
+      );
+
+      const newPage = await newTarget.page();
+      if (newPage && newPage !== this.currentPage) {
+        await Promise.race([
+          waitForEvent(newPage, 'load'),
+          sleep(this.timeout),
+        ]);
+        this.currentPage = newPage;
+      }
+    } catch (err) {
+      if (!(err instanceof TimeoutError)) {
+        throw err;
+      }
+    }
+  }
+
+  public async annotateAndTakeScreenshot(): Promise<ActionResult> {
     const { screenshot, selectOptions } = await annotateAndTakeScreenshot(
       this.currentPage,
     );
     this.logs.push(screenshot);
     return { screenshot, selectOptions };
-  };
-
-  public async handleClickAction(action: { id: string }) {
-    const link = action.id;
-
-    console.log('Handling click action: ' + link);
-
-    const elements = await this.currentPage.$$(`[${LINK_ATTRIBUTE}]`);
-
-    let partial;
-    let exact;
-
-    for (const element of elements) {
-      const attributeValue = await element.evaluate(
-        (el, attribute) => el.getAttribute(attribute),
-        LINK_ATTRIBUTE,
-      );
-
-      if (attributeValue?.includes(link)) {
-        partial = element;
-      }
-
-      if (attributeValue === link) {
-        exact = element;
-      }
-    }
-
-    const elementToClick = exact || partial;
-
-    if (elementToClick) {
-      // Save target of original page to know that this was the opener:
-      const pageTarget = this.currentPage.target();
-      await elementToClick.click();
-
-      // Clicking on a link might have opened a new page.
-      // We have to check whether that's the case by waiting for target for a little bit
-      console.log('Waiting whether the link has opened a new page...');
-
-      try {
-        const newTarget = await this.browser.waitForTarget(
-          (target) => target.opener() === pageTarget,
-          {
-            // Let's wait 2 seconds after we assume no new page was opened
-            // This is also fine for any dropdowns / animations to appear that might be caused by the click
-            timeout: 2_000,
-          },
-        );
-        // Cet the new page object:
-        const newPage = await newTarget.page();
-
-        // If the page was changed, let's wait until it loads
-        if (newPage && newPage !== this.currentPage) {
-          // Additional checks could be done here, like validating the response or URL
-          await Promise.race([waitForEvent(newPage, 'load'), sleep(TIMEOUT)]);
-        }
-
-        if (newPage) {
-          this.currentPage = newPage;
-        }
-      } catch (err) {
-        // If the waitForTarget timed out, it means no new page was opened
-        if (err instanceof TimeoutError) {
-          //
-        } else {
-          throw err;
-        }
-      }
-
-      return this.annotateAndTakeScreenshot();
-    } else {
-      console.error(`Can't click link "${link}"`);
-      const availableLinkElements = [];
-      for (const element of elements) {
-        const attributeValue = await element.evaluate(
-          (el, attribute) => el.getAttribute(attribute),
-          LINK_ATTRIBUTE,
-        );
-        availableLinkElements.push(attributeValue);
-      }
-      console.error('Available links in the page: ', availableLinkElements);
-      throw new Error("This link can't be clicked");
-    }
   }
 
-  public async handleUrlAction(action: { value: string }) {
-    const url = action.value;
+  public async handleClickAction(action: {
+    id: string;
+  }): Promise<ActionResult> {
+    const { id } = action;
+    console.log('Handling click action:', id);
 
-    console.log('Handling URL action: ' + url);
+    const element = await this.findElementByAttribute(LINK_ATTRIBUTE, id);
+    if (!element) {
+      throw new Error(`Cannot find clickable element with text "${id}"`);
+    }
 
-    await this.currentPage.goto(url, {
-      waitUntil: 'networkidle0',
-      timeout: TIMEOUT,
-    });
-
-    // Mobile.de fix
-    await sleep(1000);
-
-    // Catch
-    await Promise.race([
-      waitForEvent(this.currentPage, 'load'),
-      sleep(TIMEOUT),
-    ]);
+    const pageTarget = this.currentPage.target();
+    await element.click();
+    await this.handleNewPageOpening(pageTarget);
 
     return this.annotateAndTakeScreenshot();
   }
 
-  public async handleScrollAction(action: { id: string; value: string }) {
-    const scrollableArea = action.id;
-    const value = action.value;
+  public async handleUrlAction(action: {
+    value: string;
+  }): Promise<ActionResult> {
+    const { value: url } = action;
+    console.log('Handling URL action:', url);
 
-    console.log(
-      `Handle scroll action: scrolling ${value} px of ${scrollableArea}...`,
-    );
+    try {
+      await this.currentPage.goto(url, {
+        waitUntil: 'networkidle0',
+        timeout: this.timeout,
+      });
 
-    const elements = await this.currentPage.$$(
-      `[${SCROLLABLE_AREA_ATTRIBUTE}]`,
-    );
-    let foundArea;
-
-    for (const element of elements) {
-      const attributeValue = await element.evaluate(
-        (el, attribute) => el.getAttribute(attribute),
-        SCROLLABLE_AREA_ATTRIBUTE,
-      );
-
-      // Sometimes, LLM return the identifier without i- prefix
-      if (attributeValue?.includes(scrollableArea)) {
-        foundArea = element;
-      }
-    }
-
-    if (foundArea) {
-      // TODO: scrollLeft
-      foundArea.evaluate(
-        (el, scrollAmount) => {
-          el.scrollBy(0, scrollAmount);
-        },
-        parseInt(value, 10),
-      );
+      await sleep(1000); // Wait for any dynamic content
+      await Promise.race([
+        waitForEvent(this.currentPage, 'load'),
+        sleep(this.timeout),
+      ]);
 
       return this.annotateAndTakeScreenshot();
-    } else {
-      throw new Error("Can't find provided scroll area");
+    } catch (error) {
+      throw new Error(
+        `Failed to navigate to URL "${url}": ${error instanceof Error ? error.message : 'Unknown error'}`,
+      );
     }
   }
 
-  public async handleTypeAction(action: { id: string; value: string }) {
-    const input = action.id;
-    const value = action.value;
+  public async handleTypeAction(action: {
+    id: string;
+    value: string;
+  }): Promise<ActionResult> {
+    const { id, value } = action;
+    console.log('Handling type action:', { id, value });
 
-    console.log(
-      `Handling type action: typing "${value}" into input "${input}"...`,
-    );
-
-    const elements = await this.currentPage.$$(`[${INPUT_TEXT_ATTRIBUTE}]`);
-    let partial;
-    let exact;
-
-    for (const element of elements) {
-      const attributeValue = await element.evaluate(
-        (el, attribute) => el.getAttribute(attribute),
-        INPUT_TEXT_ATTRIBUTE,
-      );
-
-      if (attributeValue?.includes(input)) {
-        partial = element;
-      }
-
-      if (attributeValue === input) {
-        exact = element;
-      }
+    const element = await this.findElementByAttribute(INPUT_TEXT_ATTRIBUTE, id);
+    if (!element) {
+      throw new Error(`Cannot find input element with identifier "${id}"`);
     }
 
-    const element = exact || partial;
-    if (element) {
-      element.type(value);
-      return this.annotateAndTakeScreenshot();
-    } else {
-      throw new Error("Can't find input field");
-    }
+    await element.type(value);
+    return this.annotateAndTakeScreenshot();
   }
 
-  public async handleSelectAction(action: { id: string; value: string }) {
-    const select = action.id;
-    const value = action.value;
+  public async handleSelectAction(action: {
+    id: string;
+    value: string;
+  }): Promise<ActionResult> {
+    const { id, value } = action;
+    console.log('Handling select action:', { id, value });
 
-    console.log(
-      `Handling select action: selecting "${value}" in "${select}"...`,
+    const element = await this.findElementByAttribute(SELECT_ATTRIBUTE, id);
+    if (!element) {
+      throw new Error(`Cannot find select element with identifier "${id}"`);
+    }
+
+    await element.select(value);
+    return this.annotateAndTakeScreenshot();
+  }
+
+  public async handleScrollAction(action: {
+    id: string;
+    value: string;
+  }): Promise<ActionResult> {
+    const { id, value } = action;
+    console.log('Handling scroll action:', { id, value: `${value}px` });
+
+    const element = await this.findElementByAttribute(
+      SCROLLABLE_AREA_ATTRIBUTE,
+      id,
+    );
+    if (!element) {
+      throw new Error(`Cannot find scrollable area with identifier "${id}"`);
+    }
+
+    const scrollAmount = parseInt(value, 10);
+    if (isNaN(scrollAmount)) {
+      throw new Error('Invalid scroll value: must be a number');
+    }
+
+    await element.evaluate(
+      (el: Element, amount: number) => el.scrollBy(0, amount),
+      scrollAmount,
     );
 
-    const elements = await this.currentPage.$$(`[${SELECT_ATTRIBUTE}]`);
-    let partial;
-    let exact;
+    return this.annotateAndTakeScreenshot();
+  }
 
-    for (const element of elements) {
-      const attributeValue = await element.evaluate(
-        (el, attribute) => el.getAttribute(attribute),
-        INPUT_TEXT_ATTRIBUTE,
-      );
-
-      if (attributeValue?.includes(select)) {
-        partial = element;
-      }
-
-      if (attributeValue === select) {
-        exact = element;
-      }
-    }
-
-    const element = exact || partial;
-    if (element) {
-      await element.select(value);
-      return this.annotateAndTakeScreenshot();
-    } else {
-      throw new Error("Can't find select field");
-    }
+  public async close(): Promise<void> {
+    await this.browser.close();
   }
 }

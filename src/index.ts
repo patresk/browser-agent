@@ -1,25 +1,39 @@
 import OpenAI from 'openai';
-
 import { ChatCompletionMessageParam } from 'openai/resources/chat/completions';
 import {
-  bufferToBase64,
+  formatBase64,
   getCLIInput,
   InvalidJsonResponseError,
   parseJsonResponse,
+  sleep,
 } from './util';
 import { createBrowserAgent } from './BrowserAgent';
 import fs from 'fs';
 import path from 'path';
+import yargs from 'yargs';
+import { hideBin } from 'yargs/helpers';
 
 require('dotenv/config');
 
-const openai = new OpenAI();
+interface ActionResult {
+  screenshot: string;
+  selectOptions: Array<{ id: string; options: string[] }> | null;
+}
 
-(async () => {
-  const messages: Array<ChatCompletionMessageParam> = [
-    {
-      role: 'system',
-      content: `
+class BrowserAgentCLI {
+  private browserAgent: Awaited<ReturnType<typeof createBrowserAgent>> | null;
+  private openai: OpenAI;
+  private messages: Array<ChatCompletionMessageParam>;
+
+  constructor() {
+    if (!process.env.OPENAI_API_KEY) {
+      throw new Error('OPENAI_API_KEY environment variable is required');
+    }
+    this.openai = new OpenAI();
+    this.messages = [
+      {
+        role: 'system',
+        content: `
 You are a website crawler that tests websites and web apps.
 You will be given instructions on what to do by browsing.
 You are connected to a web browser and you will be given the screenshot of the website you are on right now.
@@ -49,22 +63,15 @@ You can scroll a specific area by answering in the following JSON format:
 
 Once you have found the answer to the user's question, you can answer with a regular message.
 `,
-    },
-  ];
+      },
+    ];
+    this.browserAgent = null;
+  }
 
-  console.log('How can I assist you today?');
-  const prompt = await getCLIInput('You: ');
-  console.log('Your prompt:', prompt);
+  private async storeLogs(): Promise<void> {
+    if (!this.browserAgent) return;
 
-  messages.push({
-    role: 'user',
-    content: prompt as unknown as string,
-  });
-
-  const browserAgent = await createBrowserAgent();
-
-  async function storeLogs() {
-    const logs = await browserAgent.getLogs();
+    const logs = await this.browserAgent.getLogs();
     const logsDir = path.join(__dirname, 'logs');
     if (!fs.existsSync(logsDir)) {
       fs.mkdirSync(logsDir);
@@ -76,189 +83,184 @@ Once you have found the answer to the user's question, you can answer with a reg
     });
   }
 
-  process.on('SIGINT', async () => {
-    console.log('SIGINT');
-    await storeLogs();
-    process.exit();
-  });
+  private setupExitHandlers(): void {
+    const exitHandler = async () => {
+      await this.storeLogs();
+      process.exit();
+    };
 
-  process.on('SIGTERM', async () => {
-    console.log('SIGTERM');
-    await storeLogs();
-    process.exit();
-  });
+    process.on('SIGINT', exitHandler);
+    process.on('SIGTERM', exitHandler);
+  }
 
-  let screenshotTaken: Buffer | null = null;
-  let selectOptions = null;
+  private async handleAction(parsedAction: any): Promise<ActionResult | null> {
+    if (!this.browserAgent) return null;
 
-  while (true) {
-    if (screenshotTaken) {
-      const base64_image = await bufferToBase64(screenshotTaken);
-
-      let metadataText =
-        selectOptions &&
-        selectOptions.length > 0 &&
-        `
-Select element on the page have following values:
-${selectOptions?.map((selectOption) => {
-  return `${selectOption.id} = ${selectOption.options.join(', ')}\n`;
-})}
-`;
-
-      messages.push({
-        role: 'user',
-        content: [
-          {
-            type: 'image_url' as const,
-            image_url: {
-              url: base64_image,
-            },
-          },
-          {
-            type: 'text' as const,
-            text: `Here\'s the screenshot of the website you are on right now. Find the user's answer or issue url, click, type, select or scroll commands.
-
-            ${metadataText}
-            
-            If you find the answer to the user\'s question, you can respond normally.`,
-          },
-        ],
-      });
-
-      screenshotTaken = null;
-    }
-
-    const response = await openai.chat.completions.create({
-      model: 'gpt-4o',
-      max_tokens: 1024,
-      messages: messages,
-    });
-
-    const message = response.choices[0].message;
-    const chatGPTResponse = message.content;
-
-    messages.push({
-      role: 'assistant',
-      content: chatGPTResponse,
-    });
-
-    console.log('GPT response: ' + chatGPTResponse);
-
-    // Handle actions from the LLM
-    if (
-      chatGPTResponse?.includes('{"action": "') ||
-      chatGPTResponse?.includes('{"action": "')
-    ) {
-      let parsedAction;
-      try {
-        parsedAction = parseJsonResponse(chatGPTResponse);
-      } catch (err) {
-        if (err instanceof InvalidJsonResponseError) {
-          messages.push({
-            role: 'user',
-            content:
-              'Error: the JSON response you provided was invalid. Please provide a valid JSON response.',
-          });
-        } else {
-          throw err;
-        }
-      }
-
+    try {
       switch (parsedAction?.action) {
-        case 'click': {
-          try {
-            const actionResult =
-              await browserAgent.handleClickAction(parsedAction);
-            screenshotTaken = actionResult.screenshot;
-            selectOptions = actionResult.selectOptions;
-          } catch (error) {
-            console.log('Error clicking the element:', error);
-
-            messages.push({
-              role: 'user',
-              content:
-                'Error: I was unable to click that element. Can you try a different one? After the second attempt, just provide an explanation what went wrong.',
-            });
-          }
-          break;
-        }
-        case 'url': {
-          try {
-            const actionResult =
-              await browserAgent.handleUrlAction(parsedAction);
-            screenshotTaken = actionResult.screenshot;
-            selectOptions = actionResult.selectOptions;
-          } catch (err) {
-            console.error('Error handling URL action:', err);
-
-            messages.push({
-              role: 'user',
-              content:
-                'Error: I was unable to visit that URL. Provide a different url.',
-            });
-          }
-          break;
-        }
-        case 'type': {
-          try {
-            const actionResult =
-              await browserAgent.handleUrlAction(parsedAction);
-            screenshotTaken = actionResult.screenshot;
-            selectOptions = actionResult.selectOptions;
-          } catch (error) {
-            console.log('Error typing into the input:', error);
-
-            messages.push({
-              role: 'user',
-              content:
-                'Error: I was unable to typo into that input field. Because it does not exist. Please provide a different input field.',
-            });
-          }
-          break;
-        }
-        case 'select': {
-          try {
-            const actionResult =
-              await browserAgent.handleSelectAction(parsedAction);
-            screenshotTaken = actionResult.screenshot;
-            selectOptions = actionResult.selectOptions;
-          } catch (error) {
-            console.log('Error selecting an option:', error);
-
-            messages.push({
-              role: 'user',
-              content:
-                'Error: I was unable to select that option because it does not exist. Please provide a different option.',
-            });
-          }
-          break;
-        }
-        case 'scroll': {
-          try {
-            const actionResult =
-              await browserAgent.handleUrlAction(parsedAction);
-            screenshotTaken = actionResult.screenshot;
-            selectOptions = actionResult.selectOptions;
-          } catch (error) {
-            console.log('Error scrolling an area:', error);
-            messages.push({
-              role: 'user',
-              content:
-                'Error: I was unable to scroll that scroll area. Please provide a different scroll area.',
-            });
-          }
-        }
+        case 'click':
+          return await this.browserAgent.handleClickAction(parsedAction);
+        case 'url':
+          return await this.browserAgent.handleUrlAction(parsedAction);
+        case 'type':
+          return await this.browserAgent.handleTypeAction(parsedAction);
+        case 'select':
+          return await this.browserAgent.handleSelectAction(parsedAction);
+        case 'scroll':
+          return await this.browserAgent.handleScrollAction(parsedAction);
+        default:
+          console.warn('Unknown action:', parsedAction?.action);
+          return null;
       }
-    } else {
-      await storeLogs();
-
-      // Break the cycle. We've obviously were not able to handle the response
-      const prompt = (await getCLIInput('You: ')) as unknown as string;
-
-      messages.push({
-        role: 'user',
-        content: prompt,
-      });
+    } catch (error) {
+      console.error(`Error handling ${parsedAction?.action} action:`, error);
+      return null;
     }
   }
-})();
+
+  public async start(): Promise<void> {
+    console.log('How can I assist you today?');
+    const prompt = await getCLIInput('You: ');
+    console.log('Your prompt:', prompt);
+
+    this.messages.push({
+      role: 'user',
+      content: prompt as string,
+    });
+
+    const argv = await yargs(hideBin(process.argv))
+      .option('timeout', {
+        type: 'number',
+        description: 'Browser operation timeout in milliseconds',
+        default: 5000,
+      })
+      .option('viewport-width', {
+        type: 'number',
+        description: 'Browser viewport width',
+        default: 1440,
+      })
+      .option('viewport-height', {
+        type: 'number',
+        description: 'Browser viewport height',
+        default: 800,
+      })
+      .option('viewport-scale', {
+        type: 'number',
+        description: 'Browser viewport device scale factor',
+        default: 1,
+      })
+      .parse();
+
+    this.browserAgent = await createBrowserAgent({
+      headless: false,
+      timeout: argv.timeout,
+      viewport: {
+        width: argv.viewportWidth,
+        height: argv.viewportHeight,
+        deviceScaleFactor: argv.viewportScale,
+      },
+    });
+
+    this.setupExitHandlers();
+
+    let screenshotTaken: string | null = null;
+    let selectOptions = null;
+
+    while (true) {
+      try {
+        if (screenshotTaken) {
+          const base64_image = await formatBase64(screenshotTaken);
+          const metadataText =
+            selectOptions !== null && selectOptions?.length > 0
+              ? `\nSelect element on the page have following values:\n${selectOptions
+                  ?.map(
+                    (selectOption) =>
+                      `${selectOption.id} = ${selectOption.options.join(', ')}\n`,
+                  )
+                  .join('')}`
+              : '';
+
+          this.messages.push({
+            role: 'user',
+            content: [
+              {
+                type: 'image_url' as const,
+                image_url: {
+                  url: base64_image,
+                },
+              },
+              {
+                type: 'text' as const,
+                text: `Here's the screenshot of the website you are on right now. Find the user's answer or issue url, click, type, select or scroll commands.
+                ${metadataText}
+                If you find the answer to the user's question, you can respond normally.`,
+              },
+            ],
+          });
+
+          screenshotTaken = null;
+        }
+
+        const response = await this.openai.chat.completions.create({
+          model: 'gpt-4o',
+          max_tokens: 1024,
+          messages: this.messages,
+        });
+
+        const message = response.choices[0].message;
+        const chatGPTResponse = message.content;
+
+        if (!chatGPTResponse) {
+          console.error('Empty response from GPT');
+          continue;
+        }
+
+        this.messages.push({
+          role: 'assistant',
+          content: chatGPTResponse,
+        });
+
+        console.log('GPT response: ' + chatGPTResponse);
+
+        if (chatGPTResponse.includes('{"action": "')) {
+          try {
+            const parsedAction = parseJsonResponse(chatGPTResponse);
+            const actionResult = await this.handleAction(parsedAction);
+            if (actionResult) {
+              screenshotTaken = actionResult.screenshot;
+              selectOptions = actionResult.selectOptions;
+            }
+          } catch (err) {
+            if (err instanceof InvalidJsonResponseError) {
+              this.messages.push({
+                role: 'user',
+                content:
+                  'Error: the JSON response you provided was invalid. Please provide a valid JSON response.',
+              });
+            } else {
+              throw err;
+            }
+          }
+        } else {
+          const prompt = await getCLIInput('You: ');
+          console.log('Your prompt:', prompt);
+
+          this.messages.push({
+            role: 'user',
+            content: prompt as string,
+          });
+        }
+
+        await sleep(1000); // Prevent rate limiting
+      } catch (error) {
+        console.error('Error in main loop', error);
+        console.error('Terminating...');
+        break;
+      }
+    }
+  }
+}
+
+// Start the application
+const cli = new BrowserAgentCLI();
+cli.start().catch(console.error);
